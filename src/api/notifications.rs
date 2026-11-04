@@ -139,7 +139,12 @@ fn websocket_claims_match(
 
 // Re-checking an active WebSocket subscription must not hold a DB connection
 // for the full socket lifetime. Each periodic check borrows one briefly.
-async fn websocket_session_is_current(device_id: &DeviceId, user_id: &UserId, security_stamp: &str, conn: &DbConn) -> bool {
+async fn websocket_session_is_current(
+    device_id: &DeviceId,
+    user_id: &UserId,
+    security_stamp: &str,
+    conn: &DbConn,
+) -> bool {
     let Some(device) = Device::find_by_uuid_and_user(device_id, user_id, conn).await else {
         return false;
     };
@@ -165,14 +170,14 @@ mod websocket_auth_tests {
 
 #[expect(tail_expr_drop_order)]
 #[get("/hub?<data..>")]
-async fn websockets_hub<'r>(
+async fn websockets_hub(
     ws: WebSocket,
     data: WsAccessToken,
     ip: ClientIp,
     header_token: WsAccessTokenHeader,
     conn: DbConn,
-    pool: &'r rocket::State<crate::db::DbPool>,
-) -> Result<rocket_ws::Stream!['r], Error> {
+    pool: &rocket::State<crate::db::DbPool>,
+) -> Result<rocket_ws::Stream!['_], Error> {
     info!("Accepting Rocket WS connection from {}", ip.ip);
 
     let token = if let Some(token) = data.access_token {
