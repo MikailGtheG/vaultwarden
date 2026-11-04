@@ -68,6 +68,61 @@ def socket_upgrade(path):
         first=s.recv(1024).split(b"\r\n",1)[0].decode()
         return int(first.split(" ")[1])
 
+def open_ws(path):
+    """Open a real WebSocket and retain the socket for ongoing revocation checks."""
+    key=b64(os.urandom(16))
+    wire=(f"GET {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n"
+          f"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+          f"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n")
+    s=socket.create_connection((HOST,PORT),timeout=8)
+    s.settimeout(4)
+    s.sendall(wire.encode())
+    response=b""
+    while b"\r\n\r\n" not in response:
+        response += s.recv(1024)
+    if b" 101 " not in response.split(b"\r\n",1)[0]:
+        s.close()
+        raise AssertionError("valid session could not maintain a WebSocket connection")
+    return s
+
+def read_exact(sock,count):
+    result=b""
+    while len(result)<count:
+        part=sock.recv(count-len(result))
+        if not part:raise EOFError()
+        result+=part
+    return result
+
+def wait_for_revoked_websocket_close(sock,max_seconds=76):
+    """Respond to server PINGs so idle timeouts cannot masquerade as revocation."""
+    deadline=time.monotonic()+max_seconds
+    pong_count=0
+    try:
+        while time.monotonic()<deadline:
+            try:
+                header=read_exact(sock,2)
+            except socket.timeout:
+                continue
+            except EOFError:
+                return pong_count>=2
+            opcode=header[0]&0x0f
+            length=header[1]&0x7f
+            if length==126:length=int.from_bytes(read_exact(sock,2),"big")
+            elif length==127:length=int.from_bytes(read_exact(sock,8),"big")
+            mask=read_exact(sock,4) if header[1]&0x80 else None
+            payload=read_exact(sock,length)
+            if mask:payload=bytes(v^mask[i%4] for i,v in enumerate(payload))
+            if opcode==8:return pong_count>=2
+            if opcode==9:
+                # RFC 6455: client-to-server frames must be masked.
+                masking=os.urandom(4)
+                masked=bytes(v^masking[i%4] for i,v in enumerate(payload))
+                sock.sendall(bytes([0x8a,0x80|len(payload)])+masking+masked)
+                pong_count+=1
+        return False
+    finally:
+        sock.close()
+
 def run_case(scheme, trusted_proxy=False):
     origin=f"{scheme}://vault.test"
     with tempfile.TemporaryDirectory(prefix="vw-security-ci-") as d:
@@ -94,7 +149,7 @@ def run_case(scheme, trusted_proxy=False):
                 cookie_test(scheme, trusted_proxy)
                 db=sqlite3.connect(str(data/"db.sqlite3"),timeout=10)
                 try:
-                    security_tests(db,data,origin)
+                    security_tests(db,data,origin,active_check=(scheme=="http" and not trusted_proxy))
                 finally:db.close()
             except Exception:
                 print("SERVICE LOG TAIL:\n"+logs.read_text()[-6000:],file=sys.stderr)
@@ -117,7 +172,7 @@ def cookie_test(scheme,trusted_proxy):
     cookie=next((value for name,value in res.items() if name.lower()=="set-cookie"),"")
     expect(("Secure" in cookie)==(scheme=="https" or trusted_proxy),"forwarded HTTPS trusted only from configured peer")
 
-def security_tests(db,data,origin):
+def security_tests(db,data,origin,active_check=False):
     uid=str(uuid.uuid4()); did=str(uuid.uuid4()); stamp=str(uuid.uuid4())
     clock=NOW().strftime("%Y-%m-%d %H:%M:%S")
     insert(db,"users",dict(uuid=uid,enabled=1,created_at=clock,updated_at=clock,
@@ -133,8 +188,12 @@ def security_tests(db,data,origin):
         devicetype="14",client_id="web",scope=["api","offline_access"],amr=["Application"])
     ws_path="/notifications/hub?access_token="+urllib.parse.quote(login,safe="")
     expect(socket_upgrade(ws_path)==101,"valid synthetic login JWT opens WebSocket")
+    active_ws=open_ws(ws_path) if active_check else None
     db.execute("DELETE FROM devices WHERE uuid=?",(did,));db.commit()
     expect(socket_upgrade(ws_path)!=101,"removed device cannot reconnect to WebSocket")
+    if active_ws is not None:
+        expect(wait_for_revoked_websocket_close(active_ws),
+            "active revoked WebSocket closes after periodic validation, not idle timeout")
     insert(db,"devices",dict(uuid=did,created_at=clock,updated_at=clock,user_uuid=uid,
         name="synthetic-test-device",atype=14,refresh_token="ci-only-refresh"))
     db.execute("UPDATE users SET security_stamp=? WHERE uuid=?",("new-stamp",uid));db.commit()
