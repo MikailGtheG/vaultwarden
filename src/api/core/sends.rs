@@ -449,7 +449,11 @@ async fn download_url(host: &Host, send_id: &SendId, file_id: &SendFileId) -> Re
 
         Ok(format!("{}/api/sends/{send_id}/{file_id}?t={token}", host.host))
     } else {
-        Ok(operator.presign_read(&format!("{send_id}/{file_id}"), Duration::from_mins(5)).await?.uri().to_string())
+        // External presigned URLs are served directly by storage and cannot be
+        // revalidated by Vaultwarden after issuance. Limit their exposure window
+        // to two minutes, matching the local download token lifetime.
+        // Immediate S3 revocation requires a server-proxied download design.
+        Ok(operator.presign_read(&format!("{send_id}/{file_id}"), Duration::from_mins(2)).await?.uri().to_string())
     }
 }
 
