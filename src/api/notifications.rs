@@ -126,14 +126,58 @@ impl Drop for WSAnonymousEntryMapGuard {
     }
 }
 
+// A WebSocket subscription must stay bound to the same user and security
+// stamp as the signed token, not just to a syntactically valid JWT.
+fn websocket_claims_match(
+    device_user_id: &UserId,
+    token_user_id: &UserId,
+    stored_stamp: &str,
+    token_stamp: &str,
+) -> bool {
+    device_user_id == token_user_id && stored_stamp == token_stamp
+}
+
+// Re-checking an active WebSocket subscription must not hold a DB connection
+// for the full socket lifetime. Each periodic check borrows one briefly.
+async fn websocket_session_is_current(
+    device_id: &DeviceId,
+    user_id: &UserId,
+    security_stamp: &str,
+    conn: &DbConn,
+) -> bool {
+    let Some(device) = Device::find_by_uuid_and_user(device_id, user_id, conn).await else {
+        return false;
+    };
+    let Some(user) = User::find_by_uuid(user_id, conn).await else {
+        return false;
+    };
+    websocket_claims_match(&device.user_uuid, user_id, &user.security_stamp, security_stamp)
+}
+
+#[cfg(test)]
+mod websocket_auth_tests {
+    use super::{UserId, websocket_claims_match};
+
+    #[test]
+    fn rejects_mismatched_user_and_revoked_security_stamp() {
+        let user = UserId::from("user-one".to_owned());
+        let other = UserId::from("user-two".to_owned());
+        assert!(websocket_claims_match(&user, &user, "current", "current"));
+        assert!(!websocket_claims_match(&user, &other, "current", "current"));
+        assert!(!websocket_claims_match(&user, &user, "current", "revoked"));
+    }
+}
+
 #[expect(tail_expr_drop_order)]
 #[get("/hub?<data..>")]
-fn websockets_hub<'r>(
+async fn websockets_hub(
     ws: WebSocket,
     data: WsAccessToken,
     ip: ClientIp,
     header_token: WsAccessTokenHeader,
-) -> Result<rocket_ws::Stream!['r], Error> {
+    conn: DbConn,
+    pool: &rocket::State<crate::db::DbPool>,
+) -> Result<rocket_ws::Stream!['_], Error> {
     info!("Accepting Rocket WS connection from {}", ip.ip);
 
     let token = if let Some(token) = data.access_token {
@@ -147,6 +191,17 @@ fn websockets_hub<'r>(
     let Ok(claims) = crate::auth::decode_login(&token) else {
         err_code!("Invalid token", 401)
     };
+
+    // Enforce the same persisted-device and user-stamp requirements as the
+    // normal API at connection time, then recheck while the socket is open.
+    let session_device_id = claims.device.clone();
+    let session_user_id = claims.sub.clone();
+    let session_stamp = claims.sstamp.clone();
+    let session_expires_at = claims.exp;
+    if !websocket_session_is_current(&session_device_id, &session_user_id, &session_stamp, &conn).await {
+        err_code!("Revoked session", 401)
+    }
+    drop(conn);
 
     let (mut rx, guard) = {
         let users = Arc::clone(&WS_USERS);
@@ -165,6 +220,9 @@ fn websockets_hub<'r>(
             let mut ws = ws;
             let _guard = guard;
             let mut interval = tokio::time::interval(WS_PING_INTERVAL);
+            // Revalidate existing subscriptions every minute. Reconnects
+            // remain subject to the immediate check above.
+            let mut session_check = tokio::time::interval(Duration::from_secs(60));
             let mut last_received = Instant::now();
             loop {
                 tokio::select! {
@@ -213,6 +271,24 @@ fn websockets_hub<'r>(
                             break;
                         }
                         yield Message::Ping(PING.to_vec());
+                    }
+                    _ = session_check.tick() => {
+                        if Utc::now().timestamp() >= session_expires_at {
+                            break;
+                        }
+                        // Fail closed on DB outages rather than continuing to
+                        // deliver events to a potentially revoked subscription.
+                        let Ok(check_conn) = pool.get().await else {
+                            break;
+                        };
+                        if !websocket_session_is_current(
+                            &session_device_id,
+                            &session_user_id,
+                            &session_stamp,
+                            &check_conn,
+                        ).await {
+                            break;
+                        }
                     }
                 }
             }
