@@ -449,18 +449,29 @@ async fn download_url(host: &Host, send_id: &SendId, file_id: &SendFileId) -> Re
 
         Ok(format!("{}/api/sends/{send_id}/{file_id}?t={token}", host.host))
     } else {
-        Ok(operator.presign_read(&format!("{send_id}/{file_id}"), Duration::from_mins(5)).await?.uri().to_string())
+        // External presigned URLs are served directly by storage and cannot be
+        // revalidated by Vaultwarden after issuance. Limit their exposure window
+        // to two minutes, matching the local download token lifetime.
+        // Immediate S3 revocation requires a server-proxied download design.
+        Ok(operator.presign_read(&format!("{send_id}/{file_id}"), Duration::from_mins(2)).await?.uri().to_string())
     }
 }
 
 #[get("/sends/<send_id>/<file_id>?<t>")]
-async fn download_send(send_id: SendId, file_id: SendFileId, t: &str) -> Option<NamedFile> {
-    if let Ok(claims) = crate::auth::decode_send(t)
-        && claims.sub == format!("{send_id}/{file_id}")
-    {
-        return NamedFile::open(Path::new(&CONFIG.sends_folder()).join(send_id).join(file_id)).await.ok();
+async fn download_send(send_id: SendId, file_id: SendFileId, t: &str, conn: DbConn) -> Option<NamedFile> {
+    // Download URLs contain short-lived bearer tokens. A Send may be disabled or expire
+    // after a URL was issued, so recheck its current state before serving local files.
+    let claims = crate::auth::decode_send(t).ok()?;
+    if claims.sub != format!("{send_id}/{file_id}") {
+        return None;
     }
-    None
+
+    let send = Send::find_by_uuid(&send_id, &conn).await?;
+    if !send.is_accessible() || check_send_file_id(&send, &file_id).is_err() {
+        return None;
+    }
+
+    NamedFile::open(Path::new(&CONFIG.sends_folder()).join(send_id).join(file_id)).await.ok()
 }
 
 #[put("/sends/<send_id>", data = "<data>")]
@@ -580,4 +591,63 @@ async fn put_remove_password(send_id: SendId, headers: Headers, conn: DbConn, nt
     .await;
 
     Ok(Json(send.to_json()))
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn file_download_checks_matching_id_and_send_type() {
+        let file_id = SendFileId::from("example-file-id".to_owned());
+        let send_data = serde_json::json!({
+            "id": "example-file-id",
+            "size": 3,
+            "fileName": "example.txt"
+        });
+        let deletion_date = Utc::now().naive_utc() + TimeDelta::try_hours(1).unwrap();
+        let mut send = Send::new(
+            SendType::File as i32,
+            "example".to_owned(),
+            send_data.to_string(),
+            "encrypted-key".to_owned(),
+            deletion_date,
+        );
+
+        assert!(check_send_file_id(&send, &file_id).is_ok());
+        assert!(check_send_file_id(&send, &SendFileId::from("different".to_owned())).is_err());
+
+        send.atype = SendType::Text as i32;
+        assert!(check_send_file_id(&send, &file_id).is_err());
+    }
+
+    #[test]
+    fn revoked_or_expired_send_is_not_accessible() {
+        let now = Utc::now().naive_utc();
+        let mut send = Send::new(
+            SendType::File as i32,
+            "example".to_owned(),
+            "{}".to_owned(),
+            "encrypted-key".to_owned(),
+            now + TimeDelta::try_hours(1).unwrap(),
+        );
+
+        assert!(send.is_accessible());
+
+        send.disabled = true;
+        assert!(!send.is_accessible());
+        send.disabled = false;
+
+        send.expiration_date = Some(now - TimeDelta::try_seconds(1).unwrap());
+        assert!(!send.is_accessible());
+        send.expiration_date = None;
+
+        send.deletion_date = now - TimeDelta::try_seconds(1).unwrap();
+        assert!(!send.is_accessible());
+
+        // An expired Send must stay inaccessible even when it isn't disabled.
+        send.deletion_date = now + TimeDelta::try_hours(1).unwrap();
+        send.expiration_date = Some(now - TimeDelta::try_seconds(1).unwrap());
+        assert!(!send.is_accessible());
+    }
 }
