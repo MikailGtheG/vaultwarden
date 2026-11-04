@@ -126,6 +126,18 @@ impl Drop for WSAnonymousEntryMapGuard {
     }
 }
 
+// Re-checking an active WebSocket subscription must not hold a DB connection
+// for the full socket lifetime. Each periodic check borrows one briefly.
+async fn websocket_session_is_current(device_id: &DeviceId, user_id: &UserId, security_stamp: &str, conn: &DbConn) -> bool {
+    let Some(device) = Device::find_by_uuid_and_user(device_id, user_id, conn).await else {
+        return false;
+    };
+    let Some(user) = User::find_by_uuid(user_id, conn).await else {
+        return false;
+    };
+    device.user_uuid == *user_id && user.security_stamp == security_stamp
+}
+
 #[expect(tail_expr_drop_order)]
 #[get("/hub?<data..>")]
 async fn websockets_hub<'r>(
@@ -134,6 +146,7 @@ async fn websockets_hub<'r>(
     ip: ClientIp,
     header_token: WsAccessTokenHeader,
     conn: DbConn,
+    pool: &'r rocket::State<crate::db::DbPool>,
 ) -> Result<rocket_ws::Stream!['r], Error> {
     info!("Accepting Rocket WS connection from {}", ip.ip);
 
@@ -149,18 +162,16 @@ async fn websockets_hub<'r>(
         err_code!("Invalid token", 401)
     };
 
-    // A valid JWT signature alone is insufficient: logout, device revocation,
-    // password changes, and account deletion must also invalidate new WS sessions.
-    // The normal API guard already checks these database-backed conditions.
-    let Some(device) = Device::find_by_uuid_and_user(&claims.device, &claims.sub, &conn).await else {
-        err_code!("Invalid or revoked device", 401)
-    };
-    let Some(user) = User::find_by_uuid(&claims.sub, &conn).await else {
-        err_code!("Invalid or deleted user", 401)
-    };
-    if device.user_uuid != claims.sub || user.security_stamp != claims.sstamp {
+    // Enforce the same persisted-device and user-stamp requirements as the
+    // normal API at connection time, then recheck while the socket is open.
+    let session_device_id = claims.device.clone();
+    let session_user_id = claims.sub.clone();
+    let session_stamp = claims.sstamp.clone();
+    let session_expires_at = claims.exp;
+    if !websocket_session_is_current(&session_device_id, &session_user_id, &session_stamp, &conn).await {
         err_code!("Revoked session", 401)
     }
+    drop(conn);
 
     let (mut rx, guard) = {
         let users = Arc::clone(&WS_USERS);
@@ -179,6 +190,9 @@ async fn websockets_hub<'r>(
             let mut ws = ws;
             let _guard = guard;
             let mut interval = tokio::time::interval(WS_PING_INTERVAL);
+            // Revalidate existing subscriptions every minute. Reconnects
+            // remain subject to the immediate check above.
+            let mut session_check = tokio::time::interval(Duration::from_secs(60));
             let mut last_received = Instant::now();
             loop {
                 tokio::select! {
@@ -227,6 +241,24 @@ async fn websockets_hub<'r>(
                             break;
                         }
                         yield Message::Ping(PING.to_vec());
+                    }
+                    _ = session_check.tick() => {
+                        if Utc::now().timestamp() >= session_expires_at {
+                            break;
+                        }
+                        // Fail closed on DB outages rather than continuing to
+                        // deliver events to a potentially revoked subscription.
+                        let Ok(check_conn) = pool.get().await else {
+                            break;
+                        };
+                        if !websocket_session_is_current(
+                            &session_device_id,
+                            &session_user_id,
+                            &session_stamp,
+                            &check_conn,
+                        ).await {
+                            break;
+                        }
                     }
                 }
             }
