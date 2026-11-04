@@ -588,3 +588,57 @@ async fn put_remove_password(send_id: SendId, headers: Headers, conn: DbConn, nt
 
     Ok(Json(send.to_json()))
 }
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn file_download_checks_matching_id_and_send_type() {
+        let file_id = SendFileId::from("example-file-id".to_owned());
+        let send_data = serde_json::json!({
+            "id": "example-file-id",
+            "size": 3,
+            "fileName": "example.txt"
+        });
+        let deletion_date = Utc::now().naive_utc() + TimeDelta::try_hours(1).unwrap();
+        let mut send = Send::new(
+            SendType::File as i32,
+            "example".to_owned(),
+            send_data.to_string(),
+            "encrypted-key".to_owned(),
+            deletion_date,
+        );
+
+        assert!(check_send_file_id(&send, &file_id).is_ok());
+        assert!(check_send_file_id(&send, &SendFileId::from("different".to_owned())).is_err());
+
+        send.atype = SendType::Text as i32;
+        assert!(check_send_file_id(&send, &file_id).is_err());
+    }
+
+    #[test]
+    fn revoked_or_expired_send_is_not_accessible() {
+        let now = Utc::now().naive_utc();
+        let mut send = Send::new(
+            SendType::File as i32,
+            "example".to_owned(),
+            "{}".to_owned(),
+            "encrypted-key".to_owned(),
+            now + TimeDelta::try_hours(1).unwrap(),
+        );
+
+        assert!(send.is_accessible());
+
+        send.disabled = true;
+        assert!(!send.is_accessible());
+        send.disabled = false;
+
+        send.expiration_date = Some(now - TimeDelta::try_seconds(1).unwrap());
+        assert!(!send.is_accessible());
+        send.expiration_date = None;
+
+        send.deletion_date = now - TimeDelta::try_seconds(1).unwrap();
+        assert!(!send.is_accessible());
+    }
+}
