@@ -171,8 +171,8 @@ mod tests {
             "Bearer ",
             "Bearer  signed.jwt.token",
             "Bearer signed.jwt.token trailing",
-            "Bearer signed.jwt.token\\n",
-            "Bearer signed.jwt.token\\t",
+            "Bearer signed.jwt.token\n",
+            "Bearer signed.jwt.token\t",
         ] {
             assert_eq!(parse_send_bearer(header), None, "unexpectedly accepted {header:?}");
         }
