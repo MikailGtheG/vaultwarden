@@ -640,5 +640,10 @@ mod security_tests {
 
         send.deletion_date = now - TimeDelta::try_seconds(1).unwrap();
         assert!(!send.is_accessible());
+
+        // An expired Send must stay inaccessible even when it isn't disabled.
+        send.deletion_date = now + TimeDelta::try_hours(1).unwrap();
+        send.expiration_date = Some(now - TimeDelta::try_seconds(1).unwrap());
+        assert!(!send.is_accessible());
     }
 }
