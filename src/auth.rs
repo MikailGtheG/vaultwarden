@@ -1187,28 +1187,75 @@ pub struct Secure {
     pub https: bool,
 }
 
+// The configured HTTPS origin and the listener's TLS setting cannot be
+// downgraded by a client-supplied X-Forwarded-Proto header.
+fn cookie_is_secure(origin_is_https: bool, listener_has_tls: bool, trusted_forwarded_https: bool) -> bool {
+    origin_is_https || listener_has_tls || trusted_forwarded_https
+}
+
+// Forwarded scheme must never be accepted from an untrusted peer. Do not
+// interpret a comma-separated chain as a single, authoritative scheme.
+fn trusted_forwarded_https(peer_trusted: bool, forwarded_proto: Option<&str>) -> bool {
+    peer_trusted && forwarded_proto == Some("https")
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for Secure {
     type Error = ();
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let headers = request.headers();
-
-        // Try to guess from the headers
-        let protocol = match headers.get_one("X-Forwarded-Proto") {
-            Some(proto) => proto,
-            None => {
-                if env::var("ROCKET_TLS").is_ok() {
-                    "https"
-                } else {
-                    "http"
-                }
-            }
-        };
+        // Only trust proxy-supplied HTTPS information if the direct peer is a
+        // trusted proxy. An untrusted caller must not alter cookie security.
+        let trusted_forwarded_https = trusted_forwarded_https(
+            ip_header_is_trusted(request.remote().map(|remote| remote.ip())),
+            request.headers().get_one("X-Forwarded-Proto"),
+        );
 
         Outcome::Success(Secure {
-            https: protocol == "https",
+            https: cookie_is_secure(
+                CONFIG.domain_origin().starts_with("https://"),
+                env::var("ROCKET_TLS").is_ok(),
+                trusted_forwarded_https,
+            ),
         })
+    }
+}
+
+#[cfg(test)]
+mod secure_cookie_tests {
+    use super::{cookie_is_secure, trusted_forwarded_https};
+
+    #[test]
+    fn configured_https_origin_cannot_be_downgraded() {
+        assert!(cookie_is_secure(true, false, false));
+        assert!(cookie_is_secure(true, false, true));
+    }
+
+    #[test]
+    fn tls_listener_requires_secure_cookies() {
+        assert!(cookie_is_secure(false, true, false));
+    }
+
+    #[test]
+    fn only_trusted_https_proxy_may_upgrade_http_origin() {
+        assert!(cookie_is_secure(false, false, true));
+        assert!(!cookie_is_secure(false, false, false));
+    }
+
+    #[test]
+    fn untrusted_forwarded_proto_cannot_change_cookie_security() {
+        assert!(!trusted_forwarded_https(false, Some("https")));
+        assert!(!trusted_forwarded_https(false, Some("http")));
+        assert!(!trusted_forwarded_https(true, Some("http")));
+        assert!(!trusted_forwarded_https(true, Some("https,http")));
+        assert!(!trusted_forwarded_https(true, None));
+        assert!(trusted_forwarded_https(true, Some("https")));
+    }
+
+    #[test]
+    fn forged_http_header_cannot_downgrade_configured_https_origin() {
+        let forwarded_https = trusted_forwarded_https(false, Some("http"));
+        assert!(cookie_is_secure(true, false, forwarded_https));
     }
 }
 
