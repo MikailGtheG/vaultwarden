@@ -454,13 +454,20 @@ async fn download_url(host: &Host, send_id: &SendId, file_id: &SendFileId) -> Re
 }
 
 #[get("/sends/<send_id>/<file_id>?<t>")]
-async fn download_send(send_id: SendId, file_id: SendFileId, t: &str) -> Option<NamedFile> {
-    if let Ok(claims) = crate::auth::decode_send(t)
-        && claims.sub == format!("{send_id}/{file_id}")
-    {
-        return NamedFile::open(Path::new(&CONFIG.sends_folder()).join(send_id).join(file_id)).await.ok();
+async fn download_send(send_id: SendId, file_id: SendFileId, t: &str, conn: DbConn) -> Option<NamedFile> {
+    // Download URLs contain short-lived bearer tokens. A Send may be disabled or expire
+    // after a URL was issued, so recheck its current state before serving local files.
+    let claims = crate::auth::decode_send(t).ok()?;
+    if claims.sub != format!("{send_id}/{file_id}") {
+        return None;
     }
-    None
+
+    let send = Send::find_by_uuid(&send_id, &conn).await?;
+    if !send.is_accessible() || check_send_file_id(&send, &file_id).is_err() {
+        return None;
+    }
+
+    NamedFile::open(Path::new(&CONFIG.sends_folder()).join(send_id).join(file_id)).await.ok()
 }
 
 #[put("/sends/<send_id>", data = "<data>")]
