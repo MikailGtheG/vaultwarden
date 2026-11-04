@@ -231,14 +231,17 @@ impl Send {
     /// Returns false when the limit was already reached. The check and the increment are a single
     /// statement, otherwise concurrent accesses can both pass the check and exceed the limit.
     pub async fn register_access(&mut self, conn: &DbConn) -> Result<bool, crate::Error> {
-        self.update_users_revision(conn).await;
-
         let revision_date = Utc::now().naive_utc();
         let uuid = self.uuid.clone();
         let updated = conn
             .run(move |conn| {
                 diesel::update(sends::table)
                     .filter(sends::uuid.eq(uuid))
+                    // Recheck validity in the same statement as the access count increment.
+                    // A Send can be disabled or expire after the endpoint's initial check.
+                    .filter(sends::disabled.eq(false))
+                    .filter(sends::deletion_date.gt(revision_date))
+                    .filter(sends::expiration_date.is_null().or(sends::expiration_date.gt(revision_date)))
                     .filter(
                         sends::max_access_count
                             .is_null()
@@ -253,6 +256,8 @@ impl Send {
             return Ok(false);
         }
 
+        // The API access handlers publish the user revision and notification after success.
+        // Do not perform another revision write here for the same access.
         self.access_count += 1;
         self.revision_date = revision_date;
         Ok(true)
