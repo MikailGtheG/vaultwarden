@@ -239,6 +239,11 @@ impl Send {
             .run(move |conn| {
                 diesel::update(sends::table)
                     .filter(sends::uuid.eq(uuid))
+                    // Recheck validity in the same statement as the access count increment.
+                    // A Send can be disabled or expire after the endpoint's initial check.
+                    .filter(sends::disabled.eq(false))
+                    .filter(sends::deletion_date.gt(revision_date))
+                    .filter(sends::expiration_date.is_null().or(sends::expiration_date.gt(revision_date)))
                     .filter(
                         sends::max_access_count
                             .is_null()
