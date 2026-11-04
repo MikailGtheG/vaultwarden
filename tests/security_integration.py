@@ -108,13 +108,13 @@ def run_case(scheme, trusted_proxy=False):
 def cookie_test(scheme,trusted_proxy):
     headers={"Content-Type":"application/x-www-form-urlencoded","X-Forwarded-Proto":"http"}
     status,res,_=request("POST","/admin/",urllib.parse.urlencode({"token":ADMIN_SECRET}),headers)
-    cookie=res.get("Set-Cookie","")
-    expect(status in (200,302,303) and cookie,"admin login creates a session cookie")
+    cookie=next((value for name,value in res.items() if name.lower()=="set-cookie"),"")
+    expect(status in (200,302,303) and cookie,f"admin login creates a session cookie (status={status}, response_headers={list(res)})")
     expect(("Secure" in cookie)==(scheme=="https"),"public HTTPS origin determines cookie Secure attribute")
     # Explicitly test a forged HTTPS header from an untrusted client.
     headers["X-Forwarded-Proto"]="https"
     status,res,_=request("POST","/admin/",urllib.parse.urlencode({"token":ADMIN_SECRET}),headers)
-    cookie=res.get("Set-Cookie","")
+    cookie=next((value for name,value in res.items() if name.lower()=="set-cookie"),"")
     expect(("Secure" in cookie)==(scheme=="https" or trusted_proxy),"forwarded HTTPS trusted only from configured peer")
 
 def security_tests(db,data,origin):
