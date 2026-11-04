@@ -120,8 +120,13 @@ pub struct SendHeaders {
 // Accept exactly one Bearer credential. Splitting from the right can accidentally
 // accept malformed headers such as "Basic Bearer <token>" or a bare JWT.
 fn parse_send_bearer(header: &str) -> Option<&str> {
-    let (scheme, token) = header.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("Bearer") || token.is_empty() || token.contains(char::is_whitespace) {
+    // RFC 7235 allows one or more SP characters between the auth scheme and credentials.
+    let (scheme, credentials) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = credentials.trim_start_matches(' ');
+    if token.is_empty() || token.contains(char::is_whitespace) {
         return None;
     }
     Some(token)
@@ -159,6 +164,8 @@ mod tests {
         assert_eq!(parse_send_bearer("Bearer signed.jwt.token"), Some("signed.jwt.token"));
         assert_eq!(parse_send_bearer("bearer signed.jwt.token"), Some("signed.jwt.token"));
         assert_eq!(parse_send_bearer("BEARER signed.jwt.token"), Some("signed.jwt.token"));
+        assert_eq!(parse_send_bearer("Bearer  signed.jwt.token"), Some("signed.jwt.token"));
+        assert_eq!(parse_send_bearer("Bearer    signed.jwt.token"), Some("signed.jwt.token"));
     }
 
     #[test]
@@ -170,7 +177,8 @@ mod tests {
             "Basic Bearer signed.jwt.token",
             "Bearer",
             "Bearer ",
-            "Bearer  signed.jwt.token",
+            "Bearer signed.jwt.token ",
+            "Bearer \tsigned.jwt.token",
             "Bearer signed.jwt.token trailing",
             "Bearer signed.jwt.token\n",
             "Bearer signed.jwt.token\t",
