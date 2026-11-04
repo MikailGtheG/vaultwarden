@@ -93,8 +93,12 @@ def read_exact(sock,count):
         result+=part
     return result
 
-def wait_for_revoked_websocket_close(sock,max_seconds=76):
-    """Respond to server PINGs so idle timeouts cannot masquerade as revocation."""
+def observe_websocket(sock,max_seconds,expect_close):
+    """Hold a socket open with real PING/PONG, or detect its revocation closure.
+
+    Check a sustained healthy connection BEFORE revocation so a server-side
+    idle timeout cannot masquerade as successful session revocation.
+    """
     deadline=time.monotonic()+max_seconds
     pong_count=0
     try:
@@ -103,8 +107,8 @@ def wait_for_revoked_websocket_close(sock,max_seconds=76):
                 header=read_exact(sock,2)
             except socket.timeout:
                 continue
-            except EOFError:
-                return pong_count>=2
+            except (EOFError,ConnectionResetError):
+                return expect_close
             opcode=header[0]&0x0f
             length=header[1]&0x7f
             if length==126:length=int.from_bytes(read_exact(sock,2),"big")
@@ -112,16 +116,16 @@ def wait_for_revoked_websocket_close(sock,max_seconds=76):
             mask=read_exact(sock,4) if header[1]&0x80 else None
             payload=read_exact(sock,length)
             if mask:payload=bytes(v^mask[i%4] for i,v in enumerate(payload))
-            if opcode==8:return pong_count>=2
+            if opcode==8:return expect_close
             if opcode==9:
-                # RFC 6455: client-to-server frames must be masked.
                 masking=os.urandom(4)
                 masked=bytes(v^masking[i%4] for i,v in enumerate(payload))
                 sock.sendall(bytes([0x8a,0x80|len(payload)])+masking+masked)
                 pong_count+=1
-        return False
+        return not expect_close and pong_count>=2
     finally:
-        sock.close()
+        if expect_close:
+            sock.close()
 
 def run_case(scheme, trusted_proxy=False):
     origin=f"{scheme}://vault.test"
@@ -189,11 +193,14 @@ def security_tests(db,data,origin,active_check=False):
     ws_path="/notifications/hub?access_token="+urllib.parse.quote(login,safe="")
     expect(socket_upgrade(ws_path)==101,"valid synthetic login JWT opens WebSocket")
     active_ws=open_ws(ws_path) if active_check else None
+    if active_ws is not None:
+        expect(observe_websocket(active_ws,34,False),
+            "WebSocket remains healthy beyond idle timeout when client answers PINGs")
     db.execute("DELETE FROM devices WHERE uuid=?",(did,));db.commit()
     expect(socket_upgrade(ws_path)!=101,"removed device cannot reconnect to WebSocket")
     if active_ws is not None:
-        expect(wait_for_revoked_websocket_close(active_ws),
-            "active revoked WebSocket closes after periodic validation, not idle timeout")
+        expect(observe_websocket(active_ws,76,True),
+            "existing WebSocket closes after revocation while PING/PONG stays active")
     insert(db,"devices",dict(uuid=did,created_at=clock,updated_at=clock,user_uuid=uid,
         name="synthetic-test-device",atype=14,refresh_token="ci-only-refresh"))
     db.execute("UPDATE users SET security_stamp=? WHERE uuid=?",("new-stamp",uid));db.commit()
