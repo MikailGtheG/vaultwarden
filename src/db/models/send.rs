@@ -231,8 +231,6 @@ impl Send {
     /// Returns false when the limit was already reached. The check and the increment are a single
     /// statement, otherwise concurrent accesses can both pass the check and exceed the limit.
     pub async fn register_access(&mut self, conn: &DbConn) -> Result<bool, crate::Error> {
-        self.update_users_revision(conn).await;
-
         let revision_date = Utc::now().naive_utc();
         let uuid = self.uuid.clone();
         let updated = conn
@@ -258,6 +256,8 @@ impl Send {
             return Ok(false);
         }
 
+        // Only publish a revision for an access that was actually accepted.
+        self.update_users_revision(conn).await;
         self.access_count += 1;
         self.revision_date = revision_date;
         Ok(true)
