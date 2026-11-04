@@ -158,6 +158,7 @@ mod tests {
     fn accepts_standard_bearer_header() {
         assert_eq!(parse_send_bearer("Bearer signed.jwt.token"), Some("signed.jwt.token"));
         assert_eq!(parse_send_bearer("bearer signed.jwt.token"), Some("signed.jwt.token"));
+        assert_eq!(parse_send_bearer("BEARER signed.jwt.token"), Some("signed.jwt.token"));
     }
 
     #[test]
