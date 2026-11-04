@@ -117,6 +117,21 @@ pub struct SendHeaders {
     pub send_id: SendId,
 }
 
+// Accept exactly one Bearer credential. Splitting from the right can accidentally
+// accept malformed headers such as "Basic Bearer <token>" or a bare JWT.
+fn parse_send_bearer(header: &str) -> Option<&str> {
+    // RFC 7235 allows one or more SP characters between the auth scheme and credentials.
+    let (scheme, credentials) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = credentials.trim_start_matches(' ');
+    if token.is_empty() || token.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(token)
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for SendHeaders {
     type Error = &'static str;
@@ -124,15 +139,9 @@ impl<'r> FromRequest<'r> for SendHeaders {
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = request.headers();
 
-        // Get access_token
-        let access_token: &str = if let Some(a) = headers.get_one("Authorization") {
-            if let Some(split) = a.rsplit("Bearer ").next() {
-                split
-            } else {
-                err_handler!("No access token provided")
-            }
-        } else {
-            err_handler!("No access token provided")
+        // Require a well-formed Bearer authorization header before validating the JWT.
+        let Some(access_token) = headers.get_one("Authorization").and_then(parse_send_bearer) else {
+            err_handler!("No valid Bearer access token provided")
         };
 
         // Check JWT token is valid and get send_id
@@ -143,5 +152,38 @@ impl<'r> FromRequest<'r> for SendHeaders {
         Outcome::Success(SendHeaders {
             send_id: claims.sub.into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_send_bearer;
+
+    #[test]
+    fn accepts_standard_bearer_header() {
+        assert_eq!(parse_send_bearer("Bearer signed.jwt.token"), Some("signed.jwt.token"));
+        assert_eq!(parse_send_bearer("bearer signed.jwt.token"), Some("signed.jwt.token"));
+        assert_eq!(parse_send_bearer("BEARER signed.jwt.token"), Some("signed.jwt.token"));
+        assert_eq!(parse_send_bearer("Bearer  signed.jwt.token"), Some("signed.jwt.token"));
+        assert_eq!(parse_send_bearer("Bearer    signed.jwt.token"), Some("signed.jwt.token"));
+    }
+
+    #[test]
+    fn rejects_missing_or_ambiguous_bearer_credentials() {
+        for header in [
+            "",
+            "signed.jwt.token",
+            "Basic signed.jwt.token",
+            "Basic Bearer signed.jwt.token",
+            "Bearer",
+            "Bearer ",
+            "Bearer signed.jwt.token ",
+            "Bearer \tsigned.jwt.token",
+            "Bearer signed.jwt.token trailing",
+            "Bearer signed.jwt.token\n",
+            "Bearer signed.jwt.token\t",
+        ] {
+            assert_eq!(parse_send_bearer(header), None, "unexpectedly accepted {header:?}");
+        }
     }
 }
