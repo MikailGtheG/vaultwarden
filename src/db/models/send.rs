@@ -256,8 +256,8 @@ impl Send {
             return Ok(false);
         }
 
-        // Only publish a revision for an access that was actually accepted.
-        self.update_users_revision(conn).await;
+        // The API access handlers publish the user revision and notification after success.
+        // Do not perform another revision write here for the same access.
         self.access_count += 1;
         self.revision_date = revision_date;
         Ok(true)
