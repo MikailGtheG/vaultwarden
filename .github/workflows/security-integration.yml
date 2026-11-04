@@ -1,0 +1,44 @@
+name: Security Integration (isolated)
+permissions:
+  contents: read
+
+on:
+  push:
+    paths:
+      - "tests/security_integration.py"
+      - ".github/workflows/security-integration.yml"
+      - "src/**"
+      - "Cargo.*"
+  pull_request:
+    paths:
+      - "tests/security_integration.py"
+      - ".github/workflows/security-integration.yml"
+      - "src/**"
+      - "Cargo.*"
+
+jobs:
+  security-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-Dwarnings"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl libmariadb-dev-compat libpq-dev libssl-dev pkg-config
+      - name: Set Rust version
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --no-self-update
+          rustup default 1.99.1
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: "v2026.11-security-integration"
+      - name: Build Vaultwarden with SQLite
+        run: cargo build --profile ci --features sqlite
+      - name: Run live integration tests with synthetic data
+        run: python3 tests/security_integration.py target/ci/vaultwarden
