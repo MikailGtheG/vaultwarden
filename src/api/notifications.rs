@@ -128,11 +128,12 @@ impl Drop for WSAnonymousEntryMapGuard {
 
 #[expect(tail_expr_drop_order)]
 #[get("/hub?<data..>")]
-fn websockets_hub<'r>(
+async fn websockets_hub<'r>(
     ws: WebSocket,
     data: WsAccessToken,
     ip: ClientIp,
     header_token: WsAccessTokenHeader,
+    conn: DbConn,
 ) -> Result<rocket_ws::Stream!['r], Error> {
     info!("Accepting Rocket WS connection from {}", ip.ip);
 
@@ -147,6 +148,19 @@ fn websockets_hub<'r>(
     let Ok(claims) = crate::auth::decode_login(&token) else {
         err_code!("Invalid token", 401)
     };
+
+    // A valid JWT signature alone is insufficient: logout, device revocation,
+    // password changes, and account deletion must also invalidate new WS sessions.
+    // The normal API guard already checks these database-backed conditions.
+    let Some(device) = Device::find_by_uuid_and_user(&claims.device, &claims.sub, &conn).await else {
+        err_code!("Invalid or revoked device", 401)
+    };
+    let Some(user) = User::find_by_uuid(&claims.sub, &conn).await else {
+        err_code!("Invalid or deleted user", 401)
+    };
+    if device.user_uuid != claims.sub || user.security_stamp != claims.sstamp {
+        err_code!("Revoked session", 401)
+    }
 
     let (mut rx, guard) = {
         let users = Arc::clone(&WS_USERS);
