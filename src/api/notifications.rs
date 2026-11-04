@@ -126,6 +126,17 @@ impl Drop for WSAnonymousEntryMapGuard {
     }
 }
 
+// A WebSocket subscription must stay bound to the same user and security
+// stamp as the signed token, not just to a syntactically valid JWT.
+fn websocket_claims_match(
+    device_user_id: &UserId,
+    token_user_id: &UserId,
+    stored_stamp: &str,
+    token_stamp: &str,
+) -> bool {
+    device_user_id == token_user_id && stored_stamp == token_stamp
+}
+
 // Re-checking an active WebSocket subscription must not hold a DB connection
 // for the full socket lifetime. Each periodic check borrows one briefly.
 async fn websocket_session_is_current(device_id: &DeviceId, user_id: &UserId, security_stamp: &str, conn: &DbConn) -> bool {
@@ -135,7 +146,21 @@ async fn websocket_session_is_current(device_id: &DeviceId, user_id: &UserId, se
     let Some(user) = User::find_by_uuid(user_id, conn).await else {
         return false;
     };
-    device.user_uuid == *user_id && user.security_stamp == security_stamp
+    websocket_claims_match(&device.user_uuid, user_id, &user.security_stamp, security_stamp)
+}
+
+#[cfg(test)]
+mod websocket_auth_tests {
+    use super::{UserId, websocket_claims_match};
+
+    #[test]
+    fn rejects_mismatched_user_and_revoked_security_stamp() {
+        let user = UserId::from("user-one".to_owned());
+        let other = UserId::from("user-two".to_owned());
+        assert!(websocket_claims_match(&user, &user, "current", "current"));
+        assert!(!websocket_claims_match(&user, &other, "current", "current"));
+        assert!(!websocket_claims_match(&user, &user, "current", "revoked"));
+    }
 }
 
 #[expect(tail_expr_drop_order)]
