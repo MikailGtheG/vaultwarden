@@ -2,19 +2,11 @@ name: Security Integration (isolated)
 permissions:
   contents: read
 
+# Run for every change: security-relevant behavior can also change in
+# migrations, templates, scripts, configuration and dependency workflows.
 on:
   push:
-    paths:
-      - "tests/security_integration.py"
-      - ".github/workflows/security-integration.yml"
-      - "src/**"
-      - "Cargo.*"
   pull_request:
-    paths:
-      - "tests/security_integration.py"
-      - ".github/workflows/security-integration.yml"
-      - "src/**"
-      - "Cargo.*"
 
 jobs:
   security-integration:
